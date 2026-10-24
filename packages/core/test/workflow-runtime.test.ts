@@ -404,6 +404,25 @@ void test("workflow source and args stay out of the worker's command line, which
   }
 });
 
+void test("a worker that fork() cannot start rejects the run result and removes its temporary directory", linux, async () => {
+  // Linux refuses to start a process with an environment string over 128 KiB, and fork() throws E2BIG synchronously.
+  const originalTmpdir = process.env.TMPDIR;
+  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-unstartable-"));
+  process.env.TMPDIR = root;
+  process.env.PI_EXTENSIBLE_WORKFLOWS_TEST_OVERSIZED = "x".repeat(200_000);
+  try {
+    let execution: ReturnType<typeof runWorkflow> | undefined;
+    assert.doesNotThrow(() => { execution = runWorkflow("return 1;"); });
+    await assert.rejects(execution?.result ?? Promise.resolve(), (error: unknown) => error instanceof WorkflowError && error.code === "INTERNAL_ERROR" && /E2BIG/.test(error.message));
+    assert.deepEqual(readdirSync(root), []);
+  } finally {
+    delete process.env.PI_EXTENSIBLE_WORKFLOWS_TEST_OVERSIZED;
+    if (originalTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmpdir;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 void test("workflow workers support a symlinked temporary directory", async () => {
   const tmpdirVariable = process.platform === "win32" ? "TEMP" : "TMPDIR";
   const originalTmpdir = process.env[tmpdirVariable];

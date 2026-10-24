@@ -517,34 +517,50 @@ function workflowErrorFromWorker(error: WorkerErrorShape): WorkflowError {
   const typed = markWorkflowAuthored(new WorkflowError(code, error.message), Boolean(error.authored) || error.code === undefined);
   return error.failedAt === undefined ? typed : Object.assign(typed, { failedAt: error.failedAt });
 }
+/** Forks the sandboxed worker in a new directory; a worker that cannot start leaves no directory behind. */
+function startWorker(config: string): { child: ChildProcess; childDir: string } {
+  const childDir = realpathSync(mkdtempSync(join(tmpdir(), "pi-wf-")));
+  try {
+    const childFile = join(childDir, "child.cjs");
+    writeFileSync(childFile, childSource);
+    // NOTE: the config reaches the worker as a file in childDir, the one directory it may read, not as an argument: Windows caps a
+    // command line at 32,767 characters, Linux caps one argument at 128 KiB, and other local users can read a process's arguments.
+    const configFile = join(childDir, "config.json");
+    writeFileSync(configFile, config);
+    const child = fork(childFile, [String(RPC_LIMIT_BYTES), configFile], {
+      execArgv: (() => {
+        const filtered: string[] = [];
+        const skip = new Set(["--input-type", "-e", "--eval", "-p", "--print"]);
+        let skipNext = false;
+        for (const arg of process.execArgv) {
+          if (skipNext) { skipNext = false; continue; }
+          if (skip.has(arg) || skip.has(arg.split("=")[0] ?? "")) { if (!arg.includes("=")) skipNext = true; continue; }
+          filtered.push(arg);
+        }
+        // NOTE: Bun has no --permission model and rejects/ignores these Node flags; the worker keeps only the vm sandbox there.
+        return process.versions.bun ? filtered : [...filtered, "--max-old-space-size=128", "--permission", `--allow-fs-read=${childDir}`];
+      })(),
+      // NOTE: a Bun-compiled pi binary is process.execPath; BUN_BE_BUN makes it run child.cjs instead of the pi CLI.
+      env: process.versions.bun ? { ...process.env, BUN_BE_BUN: "1" } : process.env,
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+      serialization: "advanced",
+    });
+    return { child, childDir };
+  } catch (error) {
+    rmSync(childDir, { recursive: true, force: true });
+    throw error;
+  }
+}
 export function runWorkflow(script: string, args: JsonValue = null, bridge: WorkflowBridge = {}, signal?: AbortSignal): WorkflowExecution {
   encoded(args);
   const config = JSON.stringify({ script: instrumentWorkflow(script), args: structuredClone(args), functions: bridge.functions ?? {} });
-  const childDir = realpathSync(mkdtempSync(join(tmpdir(), "pi-wf-")));
-  const childFile = join(childDir, "child.cjs");
-  writeFileSync(childFile, childSource);
-  // NOTE: the config reaches the worker as a file in childDir, the one directory it may read, not as an argument: Windows caps a
-  // command line at 32,767 characters, Linux caps one argument at 128 KiB, and other local users can read a process's arguments.
-  const configFile = join(childDir, "config.json");
-  writeFileSync(configFile, config);
-  const child: ChildProcess = fork(childFile, [String(RPC_LIMIT_BYTES), configFile], {
-    execArgv: (() => {
-      const filtered: string[] = [];
-      const skip = new Set(["--input-type", "-e", "--eval", "-p", "--print"]);
-      let skipNext = false;
-      for (const arg of process.execArgv) {
-        if (skipNext) { skipNext = false; continue; }
-        if (skip.has(arg) || skip.has(arg.split("=")[0] ?? "")) { if (!arg.includes("=")) skipNext = true; continue; }
-        filtered.push(arg);
-      }
-      // NOTE: Bun has no --permission model and rejects/ignores these Node flags; the worker keeps only the vm sandbox there.
-      return process.versions.bun ? filtered : [...filtered, "--max-old-space-size=128", "--permission", `--allow-fs-read=${childDir}`];
-    })(),
-    // NOTE: a Bun-compiled pi binary is process.execPath; BUN_BE_BUN makes it run child.cjs instead of the pi CLI.
-    env: process.versions.bun ? { ...process.env, BUN_BE_BUN: "1" } : process.env,
-    stdio: ["ignore", "ignore", "ignore", "ipc"],
-    serialization: "advanced",
-  });
+  let worker: { child: ChildProcess; childDir: string };
+  try { worker = startWorker(config); } catch (error) {
+    // NOTE: the host persists a run as running before it launches it and records a failure only from `result`, so a worker that
+    // cannot start (a missing temporary directory, or fork() refusing an environment string over Linux's 128 KiB) rejects it.
+    return { result: Promise.reject(new WorkflowError("INTERNAL_ERROR", errorText(error))), cancel: () => undefined };
+  }
+  const { child, childDir } = worker;
   const controller = new AbortController();
   let settled = false;
   let rejectResult: (error: WorkflowError) => void = () => undefined;

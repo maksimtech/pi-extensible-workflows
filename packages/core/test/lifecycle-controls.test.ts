@@ -463,6 +463,61 @@ void test("cold resume does not duplicate the phase recorded before interruption
     await secondShutdown?.();
   }
 });
+void test("a cold resume whose worker cannot be started fails the run instead of leaving it running", async () => {
+  type Tool = { name: string; execute: (...args: unknown[]) => Promise<unknown> };
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-unstartable-resume-"));
+  const context = { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify() {} } };
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const createHeldSession = async (input: SessionInput): Promise<TestPiSession> => ({
+    sessionId: `unstartable-${input.sessionLabel}`, sessionFile: `/sessions/unstartable-${input.sessionLabel}.jsonl`,
+    messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }),
+    prompt: async () => { await held; },
+    steer: async () => {},
+    abort: async () => { release(); },
+    dispose() {},
+  });
+  const firstTools: Tool[] = [];
+  let firstShutdown: (() => Promise<void>) | undefined;
+  workflowExtension(testExtensionApi({ registerTool(tool: Tool) { firstTools.push(tool); }, registerCommand() {}, on(name: string, handler: unknown) { if (name === "session_shutdown") firstShutdown = handler as typeof firstShutdown; }, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(createHeldSession));
+  const firstWorkflow = firstTools.find(({ name }) => name === "workflow");
+  assert.ok(firstWorkflow);
+  const first = await firstWorkflow.execute("unstartable-first", { name: "unstartable-resume", script: "return await agent('wait');" }, undefined, undefined, context) as { content: Array<{ text: string }> };
+  const runId = (JSON.parse(first.content[0]?.text ?? "null") as { runId: string }).runId;
+  const store = new RunStore(home, "session", runId, home);
+  await waitForIssue105(async () => (await store.load()).run.agents.length > 0);
+  await firstShutdown?.();
+  assert.equal((await store.load()).run.state, "interrupted");
+  const secondTools: Tool[] = [];
+  let secondStart: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let secondCommand: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+  let secondShutdown: (() => Promise<void>) | undefined;
+  workflowExtension(testExtensionApi({ registerTool(tool: Tool) { secondTools.push(tool); }, registerCommand(_name: string, value: { handler: NonNullable<typeof secondCommand> }) { secondCommand = value.handler; }, on(name: string, handler: unknown) { if (name === "session_start") secondStart = handler as typeof secondStart; if (name === "session_shutdown") secondShutdown = handler as typeof secondShutdown; }, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(createHeldSession));
+  // The worker's temporary directory cannot be created under a regular file.
+  const tmpdirVariable = process.platform === "win32" ? "TEMP" : "TMPDIR";
+  const originalTmpdir = process.env[tmpdirVariable];
+  const notADirectory = join(home, "not-a-directory");
+  writeFileSync(notADirectory, "");
+  try {
+    assert.ok(secondStart && secondCommand);
+    await secondStart({}, context);
+    process.env[tmpdirVariable] = notADirectory;
+    await contextualWorkflowAction(secondCommand, context, runId, "Resume").catch(() => undefined);
+    for (let attempt = 0; attempt < 1000 && (await store.load()).run.state !== "failed"; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    const resumed = (await store.load()).run;
+    assert.equal(resumed.state, "failed");
+    assert.equal(resumed.error?.code, "INTERNAL_ERROR");
+    assert.match(resumed.error.message, /not-a-directory/);
+  } finally {
+    if (originalTmpdir === undefined) {
+      if (tmpdirVariable === "TEMP") delete process.env.TEMP;
+      else delete process.env.TMPDIR;
+    } else process.env[tmpdirVariable] = originalTmpdir;
+    release();
+    await secondShutdown?.();
+  }
+});
 void test("session recovery emits interruption as state change only", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-interruption-events-"));
   const cwd = join(home, "project");
